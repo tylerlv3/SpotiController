@@ -1,4 +1,5 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -38,26 +39,50 @@ SPOTIFY_SCOPE = "user-read-playback-state user-read-currently-playing"
 # Spotify token management
 token_info = None
 sp = None
+auth_manager = SpotifyOAuth(
+    client_id=SPOTIFY_CLIENT_ID,
+    client_secret=SPOTIFY_CLIENT_SECRET,
+    redirect_uri=SPOTIFY_REDIRECT_URI,
+    scope=SPOTIFY_SCOPE
+)
 
 def get_spotify_client():
     global token_info, sp
     if not sp or not token_info or token_info['expires_at'] < datetime.now().timestamp():
-        auth_manager = SpotifyOAuth(
-            client_id=SPOTIFY_CLIENT_ID,
-            client_secret=SPOTIFY_CLIENT_SECRET,
-            redirect_uri=SPOTIFY_REDIRECT_URI,
-            scope=SPOTIFY_SCOPE
-        )
         token_info = auth_manager.get_cached_token()
         if not token_info:
-            auth_url = auth_manager.get_authorize_url()
-            print(f"Please visit this URL to authorize the application: {auth_url}")
-            code = input("Enter the code from the redirect URL: ")
-            token_info = auth_manager.get_access_token(code)
-        
+            # Return None if no valid token, the application should redirect to /login
+            return None
         sp = spotipy.Spotify(auth=token_info['access_token'])
         logger.info("Spotify client initialized/refreshed")
     return sp
+
+@app.get("/login")
+async def login():
+    """Redirect to Spotify authorization page"""
+    auth_url = auth_manager.get_authorize_url()
+    return RedirectResponse(url=auth_url)
+
+@app.get("/callback")
+async def callback(request: Request):
+    """Handle the callback from Spotify"""
+    code = request.query_params.get("code")
+    if code:
+        global token_info
+        try:
+            token_info = auth_manager.get_access_token(code)
+            return {"status": "Successfully authenticated with Spotify!"}
+        except Exception as e:
+            logger.error(f"Error getting access token: {e}")
+            return {"error": "Failed to get access token"}
+    return {"error": "No code provided"}
+
+@app.get("/")
+async def root():
+    """Check authentication status and redirect if needed"""
+    if not get_spotify_client():
+        return RedirectResponse(url="/login")
+    return {"status": "Authenticated", "message": "Spotify WebSocket server is running"}
 
 class ConnectionManager:
     def __init__(self):
