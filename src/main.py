@@ -186,51 +186,41 @@ class ConnectionManager:
             logger.error(f"Error fetching album art: {e}")
             return None
 
-    async def broadcast_album_art(self, art_data: bytes):
+    async def broadcast_album_art_binary(self, art_data: bytes):
+        """Send album art as binary data to all connected clients"""
         if not art_data:
             return
             
         try:
-            # Encode optimized image
-            album_art_base64 = base64.b64encode(art_data).decode('utf-8')
+            # Store the art data to avoid re-sending the same image
+            self.last_art_data = art_data
             
-            # Calculate chunk size (approximately 8KB per chunk)
-            chunk_size = 8192
-            total_chunks = math.ceil(len(album_art_base64) / chunk_size)
-            
+            disconnected = []
             for connection in self.active_connections:
                 try:
-                    # Send metadata about the incoming chunks
+                    # Send a JSON message first to inform client that binary data is coming
                     await connection.send_text(json.dumps({
-                        "type": "album_art_start",
-                        "total_chunks": total_chunks
+                        "type": "album_art_binary",
+                        "size": len(art_data),
+                        "format": "jpeg"
                     }))
                     
-                    # Send the art data in chunks
-                    for i in range(total_chunks):
-                        start = i * chunk_size
-                        end = start + chunk_size
-                        chunk = album_art_base64[start:end]
-                        
-                        await connection.send_text(json.dumps({
-                            "type": "album_art_chunk",
-                            "chunk_index": i,
-                            "data": chunk
-                        }))
-                        
-                        # Small delay between chunks to prevent overwhelming the connection
-                        await asyncio.sleep(0.05)
+                    # Then send the actual binary data
+                    await connection.send_bytes(art_data)
                     
-                    # Send completion message
-                    await connection.send_text(json.dumps({
-                        "type": "album_art_end"
-                    }))
-                    
+                except WebSocketDisconnect:
+                    disconnected.append(connection)
                 except Exception as e:
-                    logger.error(f"Error sending album art to client: {e}")
+                    logger.error(f"Error sending binary album art: {e}")
+                    disconnected.append(connection)
+            
+            # Clean up disconnected clients
+            for conn in disconnected:
+                if conn in self.active_connections:
+                    self.disconnect(conn)
                     
         except Exception as e:
-            logger.error(f"Error processing album art for broadcast: {e}")
+            logger.error(f"Error in broadcast_album_art_binary: {e}")
 
 manager = ConnectionManager()
 
@@ -238,6 +228,21 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
+        # Send current playback data if available when client connects
+        if manager.current_playback:
+            await websocket.send_text(json.dumps(manager.current_playback))
+            
+            # Also send the current album art if available
+            if manager.last_art_data:
+                # Send metadata first
+                await websocket.send_text(json.dumps({
+                    "type": "album_art_binary",
+                    "size": len(manager.last_art_data),
+                    "format": "jpeg"
+                }))
+                # Then send the binary data
+                await websocket.send_bytes(manager.last_art_data)
+        
         while True:
             data = await websocket.receive_text()  # Keep connection alive
             # Handle any incoming messages if needed
@@ -248,6 +253,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif msg.get("type") == "request_update":
                     if manager.current_playback:
                         await websocket.send_text(json.dumps(manager.current_playback))
+                        # Also resend album art on request
+                        if manager.last_art_data:
+                            await websocket.send_text(json.dumps({
+                                "type": "album_art_binary",
+                                "size": len(manager.last_art_data),
+                                "format": "jpeg"
+                            }))
+                            await websocket.send_bytes(manager.last_art_data)
             except json.JSONDecodeError:
                 pass  # Ignore non-JSON messages
     except Exception as e:
@@ -276,7 +289,8 @@ async def update_playback():
                         "album": current_playback["item"]["album"]["name"],
                         "progress_ms": current_playback["progress_ms"],
                         "duration_ms": current_playback["item"]["duration_ms"],
-                        "is_playing": current_playback["is_playing"]
+                        "is_playing": current_playback["is_playing"],
+                        "type": "track_update"
                     }
                     
                     # Check if we need to fetch new album art (only if it has changed)
@@ -293,15 +307,13 @@ async def update_playback():
                         logger.info("Fetching new album art")
                         art_data = await manager.fetch_album_art(album_art_url)
                         if art_data:
-                            # Send album art separately to avoid large messages
-                            await manager.broadcast_album_art(art_data)
+                            # Send album art as binary data
+                            await manager.broadcast_album_art_binary(art_data)
+                            manager.last_album_art = album_art_url
                         else:
                             logger.warning("Failed to fetch new album art")
 
-                    # Add URL instead of base64 in the main payload
-                    track_info["album_art"] = album_art_url
-                    track_info["type"] = "track_update"
-                    
+                    # Store track info and broadcast it
                     manager.current_playback = track_info
                     await manager.broadcast(json.dumps(track_info))
                 else:
