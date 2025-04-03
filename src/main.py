@@ -1,7 +1,4 @@
-from PIL import Image
-import io
-import math
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import spotipy
@@ -10,11 +7,14 @@ import os
 from dotenv import load_dotenv
 import json
 import asyncio
-from typing import List
+from typing import List, Dict, Any, Optional
 import base64
 import aiohttp
 from datetime import datetime, timedelta
 import logging
+from PIL import Image
+import io
+import math
 from .database import Database
 
 # Configure logging
@@ -115,9 +115,35 @@ async def root():
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-        self.current_playback = None
-        self.last_album_art = None
-        self.last_art_data = None  # Cache for the processed image data
+        self.current_playback: Optional[Dict[str, Any]] = None
+        self.last_album_art: Optional[str] = None
+        self.last_art_data: Optional[bytes] = None
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"Client connected. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        logger.info(f"Client disconnected. Remaining connections: {len(self.active_connections)}")
+
+    async def broadcast(self, message: str):
+        """Broadcast a message to all connected clients"""
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except WebSocketDisconnect:
+                disconnected.append(connection)
+            except Exception as e:
+                logger.error(f"Error broadcasting message: {e}")
+                disconnected.append(connection)
+        
+        # Clean up disconnected clients
+        for conn in disconnected:
+            if conn in self.active_connections:
+                self.disconnect(conn)
 
     async def optimize_album_art(self, image_data: bytes, target_size: int = 150) -> bytes:
         try:
@@ -142,7 +168,7 @@ class ConnectionManager:
             logger.error(f"Error optimizing image: {e}")
             return image_data
 
-    async def fetch_album_art(self, url: str) -> bytes:
+    async def fetch_album_art(self, url: str) -> Optional[bytes]:
         if not url:
             return None
         try:
@@ -153,9 +179,10 @@ class ConnectionManager:
                         # Optimize the image before returning
                         return await self.optimize_album_art(image_data)
                     logger.error(f"Failed to fetch album art. Status: {response.status}")
+                    return None
         except Exception as e:
             logger.error(f"Error fetching album art: {e}")
-        return None
+            return None
 
     async def broadcast_album_art(self, art_data: bytes):
         if not art_data:
