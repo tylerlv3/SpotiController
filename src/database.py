@@ -1,8 +1,10 @@
-from sqlalchemy import create_engine, Column, String, Integer, JSON, DateTime
+from sqlalchemy import create_engine, Column, String, Integer, DateTime
+from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import json
+import os
 
 Base = declarative_base()
 
@@ -27,8 +29,16 @@ class SpotifyToken(Base):
         )
 
 class Database:
-    def __init__(self, db_url="sqlite:///spotify_tokens.db"):
-        self.engine = create_engine(db_url)
+    def __init__(self):
+        # Use DATABASE_URL from Heroku if available, otherwise use SQLite
+        database_url = os.getenv('DATABASE_URL')
+        if database_url and database_url.startswith('postgres://'):
+            # Heroku's DATABASE_URL needs to be updated to use postgresql://
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        else:
+            database_url = "sqlite:///spotify_tokens.db"
+            
+        self.engine = create_engine(database_url)
         Base.metadata.create_all(self.engine)
         self.SessionLocal = sessionmaker(bind=self.engine)
 
