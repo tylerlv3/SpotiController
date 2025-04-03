@@ -48,13 +48,37 @@ auth_manager = SpotifyOAuth(
 
 def get_spotify_client():
     global token_info, sp
-    if not sp or not token_info or token_info['expires_at'] < datetime.now().timestamp():
-        token_info = auth_manager.get_cached_token()
-        if not token_info:
-            # Return None if no valid token, the application should redirect to /login
+    
+    # Check if token exists and is expired
+    if token_info and token_info['expires_at'] < datetime.now().timestamp():
+        logger.info("Token expired, refreshing...")
+        try:
+            # Explicitly refresh the token using the refresh_token
+            token_info = auth_manager.refresh_access_token(token_info['refresh_token'])
+            sp = spotipy.Spotify(auth=token_info['access_token'])
+            logger.info("Token refreshed successfully")
+            return sp
+        except Exception as e:
+            logger.error(f"Error refreshing token: {e}")
+            token_info = None
+            sp = None
+    
+    # If no token or refresh failed, try to get cached token
+    if not token_info:
+        try:
+            token_info = auth_manager.get_cached_token()
+            if token_info:
+                sp = spotipy.Spotify(auth=token_info['access_token'])
+                logger.info("Retrieved cached token successfully")
+                return sp
+            else:
+                logger.warning("No cached token available")
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving cached token: {e}")
             return None
-        sp = spotipy.Spotify(auth=token_info['access_token'])
-        logger.info("Spotify client initialized/refreshed")
+    
+    # If token exists and is valid
     return sp
 
 @app.get("/login")
@@ -133,37 +157,51 @@ async def update_playback():
     while True:
         try:
             spotify = get_spotify_client()
-            current_playback = spotify.current_playback()
+            if not spotify:
+                logger.error("No valid Spotify client available - authentication needed")
+                await asyncio.sleep(5)  # Wait longer when auth is needed
+                continue
+                
+            try:
+                current_playback = spotify.current_playback()
+                
+                if current_playback and current_playback.get("item"):
+                    logger.info(f"Current track: {current_playback['item']['name']} by {current_playback['item']['artists'][0]['name']}")
+                    
+                    track_info = {
+                        "title": current_playback["item"]["name"],
+                        "artist": current_playback["item"]["artists"][0]["name"],
+                        "album": current_playback["item"]["album"]["name"],
+                        "album_art": current_playback["item"]["album"]["images"][0]["url"],
+                        "progress_ms": current_playback["progress_ms"],
+                        "duration_ms": current_playback["item"]["duration_ms"],
+                        "is_playing": current_playback["is_playing"]
+                    }
+
+                    # Only fetch new album art if it's different from the last one
+                    if manager.last_album_art != track_info["album_art"]:
+                        logger.info("Fetching new album art")
+                        art_data = await manager.fetch_album_art(track_info["album_art"])
+                        if art_data:
+                            track_info["album_art_base64"] = base64.b64encode(art_data).decode('utf-8')
+                            manager.last_album_art = track_info["album_art"]
+                            logger.info("New album art fetched and encoded")
+                        else:
+                            logger.warning("Failed to fetch new album art")
+
+                    manager.current_playback = track_info
+                    await manager.broadcast(json.dumps(track_info))
+                else:
+                    logger.info("No active playback found")
+            except spotipy.exceptions.SpotifyException as se:
+                if se.http_status == 401:
+                    logger.error("Spotify authentication expired, forcing refresh")
+                    # Force token refresh on next iteration
+                    global token_info
+                    token_info = None
+                else:
+                    logger.error(f"Spotify API error: {se}")
             
-            if current_playback and current_playback["item"]:
-                logger.info(f"Current track: {current_playback['item']['name']} by {current_playback['item']['artists'][0]['name']}")
-                
-                track_info = {
-                    "title": current_playback["item"]["name"],
-                    "artist": current_playback["item"]["artists"][0]["name"],
-                    "album": current_playback["item"]["album"]["name"],
-                    "album_art": current_playback["item"]["album"]["images"][0]["url"],
-                    "progress_ms": current_playback["progress_ms"],
-                    "duration_ms": current_playback["item"]["duration_ms"],
-                    "is_playing": current_playback["is_playing"]
-                }
-
-                # Only fetch new album art if it's different from the last one
-                if manager.last_album_art != track_info["album_art"]:
-                    logger.info("Fetching new album art")
-                    art_data = await manager.fetch_album_art(track_info["album_art"])
-                    if art_data:
-                        track_info["album_art_base64"] = base64.b64encode(art_data).decode('utf-8')
-                        manager.last_album_art = track_info["album_art"]
-                        logger.info("New album art fetched and encoded")
-                    else:
-                        logger.warning("Failed to fetch new album art")
-
-                manager.current_playback = track_info
-                await manager.broadcast(json.dumps(track_info))
-            else:
-                logger.info("No active playback found")
-                
         except Exception as e:
             logger.error(f"Error updating playback: {e}")
             
