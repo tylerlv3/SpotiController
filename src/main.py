@@ -149,24 +149,24 @@ class ConnectionManager:
         try:
             # Open the image using PIL
             with Image.open(io.BytesIO(image_data)) as img:
-                # Convert to RGB if image is in RGBA mode
-                if img.mode == 'RGBA':
+                # Convert to RGB mode first
+                if img.mode in ('RGBA', 'LA', 'P'):
                     img = img.convert('RGB')
                 
                 # Calculate new dimensions while maintaining aspect ratio
                 ratio = min(target_size / img.width, target_size / img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
                 
-                # Resize image
+                # Resize image using high-quality downsampling
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
                 
-                # Save as JPEG with optimization
+                # Convert to JPEG with optimization
                 output = io.BytesIO()
                 img.save(output, format='JPEG', optimize=True, quality=85)
                 return output.getvalue()
         except Exception as e:
             logger.error(f"Error optimizing image: {e}")
-            return image_data
+            return image_data  # Return original if optimization fails
 
     async def fetch_album_art(self, url: str) -> Optional[bytes]:
         if not url:
@@ -176,8 +176,10 @@ class ConnectionManager:
                 async with session.get(url) as response:
                     if response.status == 200:
                         image_data = await response.read()
-                        # Optimize the image before returning
-                        return await self.optimize_album_art(image_data)
+                        # First optimize the image to reduce size
+                        optimized = await self.optimize_album_art(image_data, target_size=120)  # Reduced to 120px
+                        logger.info(f"Image size reduced from {len(image_data)} to {len(optimized)} bytes")
+                        return optimized
                     logger.error(f"Failed to fetch album art. Status: {response.status}")
                     return None
         except Exception as e:
