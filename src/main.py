@@ -72,7 +72,7 @@ def get_spotify_client():
                 logger.info("Retrieved cached token successfully")
                 return sp
             else:
-                logger.warning("No cached token available")
+                logger.warning("No cached token available - please authenticate via /login endpoint")
                 return None
         except Exception as e:
             logger.error(f"Error retrieving cached token: {e}")
@@ -153,6 +153,27 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+@app.websocket("/ws/spotify")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()  # Keep connection alive
+            # Handle any incoming messages if needed
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                elif msg.get("type") == "request_update":
+                    if manager.current_playback:
+                        await websocket.send_text(json.dumps(manager.current_playback))
+            except json.JSONDecodeError:
+                pass  # Ignore non-JSON messages
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        manager.disconnect(websocket)
+
 async def update_playback():
     while True:
         try:
@@ -172,23 +193,47 @@ async def update_playback():
                         "title": current_playback["item"]["name"],
                         "artist": current_playback["item"]["artists"][0]["name"],
                         "album": current_playback["item"]["album"]["name"],
-                        "album_art": current_playback["item"]["album"]["images"][0]["url"],
                         "progress_ms": current_playback["progress_ms"],
                         "duration_ms": current_playback["item"]["duration_ms"],
                         "is_playing": current_playback["is_playing"]
                     }
+                    
+                    # Check if we need to fetch new album art (only if it has changed)
+                    album_art_url = current_playback["item"]["album"]["images"][0]["url"]
+                    # Get a smaller image if available to reduce payload size
+                    for image in current_playback["item"]["album"]["images"]:
+                        # Try to find a medium-sized image (around 300px)
+                        if 200 <= image["width"] <= 350:
+                            album_art_url = image["url"]
+                            break
 
                     # Only fetch new album art if it's different from the last one
-                    if manager.last_album_art != track_info["album_art"]:
+                    if manager.last_album_art != album_art_url:
                         logger.info("Fetching new album art")
-                        art_data = await manager.fetch_album_art(track_info["album_art"])
+                        art_data = await manager.fetch_album_art(album_art_url)
                         if art_data:
-                            track_info["album_art_base64"] = base64.b64encode(art_data).decode('utf-8')
-                            manager.last_album_art = track_info["album_art"]
+                            # Limit the album art size - encode separately from track info
+                            album_art_base64 = base64.b64encode(art_data).decode('utf-8')
+                            manager.last_album_art = album_art_url
                             logger.info("New album art fetched and encoded")
+                            
+                            # Send album art separately to avoid large messages
+                            for connection in manager.active_connections:
+                                try:
+                                    # Send artwork with type indicator
+                                    await connection.send_text(json.dumps({
+                                        "type": "album_art",
+                                        "album_art_base64": album_art_base64
+                                    }))
+                                except Exception as e:
+                                    logger.error(f"Error sending album art: {e}")
                         else:
                             logger.warning("Failed to fetch new album art")
 
+                    # Add URL instead of base64 in the main payload
+                    track_info["album_art"] = album_art_url
+                    track_info["type"] = "track_update"
+                    
                     manager.current_playback = track_info
                     await manager.broadcast(json.dumps(track_info))
                 else:
@@ -206,16 +251,6 @@ async def update_playback():
             logger.error(f"Error updating playback: {e}")
             
         await asyncio.sleep(1)  # Update every second
-
-@app.websocket("/ws/spotify")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    try:
-        while True:
-            await websocket.receive_text()  # Keep connection alive
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        manager.disconnect(websocket)
 
 @app.on_event("startup")
 async def startup_event():
