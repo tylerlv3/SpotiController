@@ -12,6 +12,7 @@ import base64
 import aiohttp
 from datetime import datetime, timedelta
 import logging
+from .database import Database
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = FastAPI()
+
+# Initialize database
+db = Database()
 
 # CORS middleware configuration
 app.add_middleware(
@@ -36,50 +40,45 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 SPOTIFY_SCOPE = "user-read-playback-state user-read-currently-playing"
 
-# Spotify token management
-token_info = None
-sp = None
+# Spotify auth manager
 auth_manager = SpotifyOAuth(
     client_id=SPOTIFY_CLIENT_ID,
     client_secret=SPOTIFY_CLIENT_SECRET,
     redirect_uri=SPOTIFY_REDIRECT_URI,
-    scope=SPOTIFY_SCOPE
+    scope=SPOTIFY_SCOPE,
+    open_browser=False
 )
 
 def get_spotify_client():
-    global token_info, sp
+    # Try to get token from database first
+    token_info = db.get_token()
     
-    # Check if token exists and is expired
-    if token_info and token_info['expires_at'] < datetime.now().timestamp():
-        logger.info("Token expired, refreshing...")
-        try:
-            # Explicitly refresh the token using the refresh_token
-            token_info = auth_manager.refresh_access_token(token_info['refresh_token'])
-            sp = spotipy.Spotify(auth=token_info['access_token'])
-            logger.info("Token refreshed successfully")
-            return sp
-        except Exception as e:
-            logger.error(f"Error refreshing token: {e}")
-            token_info = None
-            sp = None
-    
-    # If no token or refresh failed, try to get cached token
-    if not token_info:
-        try:
-            token_info = auth_manager.get_cached_token()
-            if token_info:
-                sp = spotipy.Spotify(auth=token_info['access_token'])
-                logger.info("Retrieved cached token successfully")
-                return sp
-            else:
-                logger.warning("No cached token available - please authenticate via /login endpoint")
+    if token_info:
+        # Check if token is expired
+        now = datetime.now().timestamp()
+        is_expired = token_info['expires_at'] - now < 60  # Add 60 second buffer
+        
+        if is_expired:
+            try:
+                # Refresh the token
+                logger.info("Token expired, refreshing...")
+                token_info = auth_manager.refresh_access_token(token_info['refresh_token'])
+                db.save_token(token_info)
+                logger.info("Token refreshed and saved to database")
+            except Exception as e:
+                logger.error(f"Error refreshing token: {e}")
                 return None
-        except Exception as e:
-            logger.error(f"Error retrieving cached token: {e}")
-            return None
+    else:
+        # Try to get cached token from Spotipy's cache
+        token_info = auth_manager.get_cached_token()
+        if token_info:
+            # Save to our database
+            db.save_token(token_info)
+            logger.info("Retrieved cached token and saved to database")
     
-    # If token exists and is valid
-    return sp
+    if token_info:
+        return spotipy.Spotify(auth=token_info['access_token'])
+    return None
 
 @app.get("/login")
 async def login():
@@ -92,9 +91,11 @@ async def callback(request: Request):
     """Handle the callback from Spotify"""
     code = request.query_params.get("code")
     if code:
-        global token_info
         try:
             token_info = auth_manager.get_access_token(code)
+            # Save token to database
+            db.save_token(token_info)
+            logger.info("New token saved to database")
             return {"status": "Successfully authenticated with Spotify!"}
         except Exception as e:
             logger.error(f"Error getting access token: {e}")
