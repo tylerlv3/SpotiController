@@ -1,3 +1,6 @@
+from PIL import Image
+import io
+import math
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -114,30 +117,30 @@ class ConnectionManager:
         self.active_connections: List[WebSocket] = []
         self.current_playback = None
         self.last_album_art = None
+        self.last_art_data = None  # Cache for the processed image data
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"New WebSocket connection. Total connections: {len(self.active_connections)}")
-        if self.current_playback:
-            await websocket.send_text(json.dumps(self.current_playback))
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-        logger.info(f"WebSocket disconnected. Remaining connections: {len(self.active_connections)}")
-
-    async def broadcast(self, message: str):
-        if not self.active_connections:
-            logger.debug("No active connections to broadcast to")
-            return
-            
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(message)
-                logger.debug("Message broadcast successfully")
-            except Exception as e:
-                logger.error(f"Error broadcasting message: {e}")
-                await self.disconnect(connection)
+    async def optimize_album_art(self, image_data: bytes, target_size: int = 150) -> bytes:
+        try:
+            # Open the image using PIL
+            with Image.open(io.BytesIO(image_data)) as img:
+                # Convert to RGB if image is in RGBA mode
+                if img.mode == 'RGBA':
+                    img = img.convert('RGB')
+                
+                # Calculate new dimensions while maintaining aspect ratio
+                ratio = min(target_size / img.width, target_size / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                
+                # Resize image
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Save as JPEG with optimization
+                output = io.BytesIO()
+                img.save(output, format='JPEG', optimize=True, quality=85)
+                return output.getvalue()
+        except Exception as e:
+            logger.error(f"Error optimizing image: {e}")
+            return image_data
 
     async def fetch_album_art(self, url: str) -> bytes:
         if not url:
@@ -146,11 +149,59 @@ class ConnectionManager:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
                     if response.status == 200:
-                        return await response.read()
+                        image_data = await response.read()
+                        # Optimize the image before returning
+                        return await self.optimize_album_art(image_data)
                     logger.error(f"Failed to fetch album art. Status: {response.status}")
         except Exception as e:
             logger.error(f"Error fetching album art: {e}")
         return None
+
+    async def broadcast_album_art(self, art_data: bytes):
+        if not art_data:
+            return
+            
+        try:
+            # Encode optimized image
+            album_art_base64 = base64.b64encode(art_data).decode('utf-8')
+            
+            # Calculate chunk size (approximately 8KB per chunk)
+            chunk_size = 8192
+            total_chunks = math.ceil(len(album_art_base64) / chunk_size)
+            
+            for connection in self.active_connections:
+                try:
+                    # Send metadata about the incoming chunks
+                    await connection.send_text(json.dumps({
+                        "type": "album_art_start",
+                        "total_chunks": total_chunks
+                    }))
+                    
+                    # Send the art data in chunks
+                    for i in range(total_chunks):
+                        start = i * chunk_size
+                        end = start + chunk_size
+                        chunk = album_art_base64[start:end]
+                        
+                        await connection.send_text(json.dumps({
+                            "type": "album_art_chunk",
+                            "chunk_index": i,
+                            "data": chunk
+                        }))
+                        
+                        # Small delay between chunks to prevent overwhelming the connection
+                        await asyncio.sleep(0.05)
+                    
+                    # Send completion message
+                    await connection.send_text(json.dumps({
+                        "type": "album_art_end"
+                    }))
+                    
+                except Exception as e:
+                    logger.error(f"Error sending album art to client: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error processing album art for broadcast: {e}")
 
 manager = ConnectionManager()
 
@@ -213,21 +264,8 @@ async def update_playback():
                         logger.info("Fetching new album art")
                         art_data = await manager.fetch_album_art(album_art_url)
                         if art_data:
-                            # Limit the album art size - encode separately from track info
-                            album_art_base64 = base64.b64encode(art_data).decode('utf-8')
-                            manager.last_album_art = album_art_url
-                            logger.info("New album art fetched and encoded")
-                            
                             # Send album art separately to avoid large messages
-                            for connection in manager.active_connections:
-                                try:
-                                    # Send artwork with type indicator
-                                    await connection.send_text(json.dumps({
-                                        "type": "album_art",
-                                        "album_art_base64": album_art_base64
-                                    }))
-                                except Exception as e:
-                                    logger.error(f"Error sending album art: {e}")
+                            await manager.broadcast_album_art(art_data)
                         else:
                             logger.warning("Failed to fetch new album art")
 

@@ -7,3 +7,4 @@ aiohttp==3.9.1
 SQLAlchemy==1.4.50
 psycopg2-binary==2.9.9
 greenlet==3.0.3
+Pillow==10.2.0
