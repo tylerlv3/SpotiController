@@ -15,20 +15,32 @@ import logging
 from PIL import Image
 import io
 import math
+import signal
+import sys
 from .database import Database
+from contextlib import asynccontextmanager
+import socket
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Enable debug logging temporarily to diagnose issues
+logger.setLevel(logging.DEBUG)
 
-app = FastAPI()
+load_dotenv()
 
 # Initialize database
 db = Database()
 
+# Signal handling for graceful shutdown
+
 # CORS middleware configuration
+app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -269,72 +281,77 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 async def update_playback():
-    while True:
+    """Background task to update playback information from Spotify"""
+    running = True
+    while running:
         try:
             spotify = get_spotify_client()
+            logger.debug(f"Acquired Spotify client for playback update {spotify.current_user}")
             if not spotify:
                 logger.error("No valid Spotify client available - authentication needed")
                 await asyncio.sleep(5)  # Wait longer when auth is needed
                 continue
-                
+
             try:
-                current_playback = spotify.current_playback()
-                
+                logger.debug("Fetching current playback from Spotify API")
+                # Add a timeout to prevent hanging
+                current_playback = await asyncio.wait_for(
+                    asyncio.to_thread(spotify.current_playback), timeout=10
+                )
+                logger.debug(f"Current playback data: {current_playback}")  # Log the raw playback data for debugging
                 if current_playback and current_playback.get("item"):
-                    logger.info(f"Current track: {current_playback['item']['name']} by {current_playback['item']['artists'][0]['name']}")
-                    
+                    track_name = current_playback["item"]["name"]
+                    artist_name = current_playback["item"]["artists"][0]["name"]
+                    logger.info(f"Current track: {track_name} by {artist_name}")
+
                     track_info = {
-                        "title": current_playback["item"]["name"],
-                        "artist": current_playback["item"]["artists"][0]["name"],
+                        "title": track_name,
+                        "artist": artist_name,
                         "album": current_playback["item"]["album"]["name"],
                         "progress_ms": current_playback["progress_ms"],
                         "duration_ms": current_playback["item"]["duration_ms"],
                         "is_playing": current_playback["is_playing"],
                         "type": "track_update"
                     }
-                    
-                    # Check if we need to fetch new album art (only if it has changed)
+
                     album_art_url = current_playback["item"]["album"]["images"][0]["url"]
-                    # Get a smaller image if available to reduce payload size
                     for image in current_playback["item"]["album"]["images"]:
-                        # Try to find a medium-sized image (around 300px)
                         if 200 <= image["width"] <= 350:
                             album_art_url = image["url"]
                             break
 
-                    # Only fetch new album art if it's different from the last one
                     if manager.last_album_art != album_art_url:
                         logger.info("Fetching new album art")
                         art_data = await manager.fetch_album_art(album_art_url)
                         if art_data:
-                            # Send album art as binary data
                             await manager.broadcast_album_art_binary(art_data)
                             manager.last_album_art = album_art_url
                         else:
                             logger.warning("Failed to fetch new album art")
 
-                    # Store track info and broadcast it
                     manager.current_playback = track_info
                     await manager.broadcast(json.dumps(track_info))
                 else:
                     logger.info("No active playback found")
+            except asyncio.TimeoutError:
+                logger.error("Spotify API call timed out")
             except spotipy.exceptions.SpotifyException as se:
                 if se.http_status == 401:
-                    logger.error("Spotify authentication expired, forcing refresh")
-                    # Force token refresh on next iteration
-                    global token_info
-                    token_info = None
+                    logger.error(f"Spotify authentication expired, forcing refresh: {se}")
+                    db.clear_tokens()
                 else:
                     logger.error(f"Spotify API error: {se}")
-            
+            except Exception as e:
+                logger.error(f"Unexpected error in Spotify API call: {e}")
+
         except Exception as e:
-            logger.error(f"Error updating playback: {e}")
-            
+            logger.error(f"Error in update_playback loop: {e}")
+
         await asyncio.sleep(1)  # Update every second
 
-@app.on_event("startup")
-async def startup_event():
-    import socket
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup (before yield)
     logger.info("="*50)
     logger.info("Starting Spotify WebSocket server...")
     
@@ -347,15 +364,30 @@ async def startup_event():
     logger.info(f"Network: ws://{local_ip}:8000/ws/spotify")
     logger.info("="*50)
     
-    asyncio.create_task(update_playback())
+    # Start the background playback updater task
+    playback_task = asyncio.create_task(update_playback())
     logger.info("Spotify client initialized/refreshed")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = 8000
-    host = "0.0.0.0"
-    logger.info("="*50)
-    logger.info(f"WebSocket server starting on ws://{host}:{port}/ws/spotify")
-    logger.info(f"Local network access: ws://[your-local-ip]:{port}/ws/spotify")
-    logger.info("="*50)
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    
+    yield
+    
+    # Shutdown (after yield)
+    logger.info("Shutting down server gracefully...")
+    # Cancel the playback updater task
+    playback_task.cancel()
+    
+    # Close all websocket connections
+    for websocket in manager.active_connections[:]:
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "server_shutdown",
+                "message": "Server is shutting down"
+            }))
+            await websocket.close()
+            manager.disconnect(websocket)
+        except Exception as e:
+            logger.error(f"Error closing websocket: {e}")
+            
+    logger.info(f"Closed all {len(manager.active_connections)} websocket connections")
+    logger.info("Shutdown complete")
+    
+app = FastAPI(lifespan=lifespan)

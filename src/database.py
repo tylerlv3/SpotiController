@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, Column, String, Integer, DateTime
 from sqlalchemy.dialects.postgresql import JSON
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import json
