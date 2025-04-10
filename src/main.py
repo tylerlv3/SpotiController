@@ -15,7 +15,7 @@ import io
 from contextlib import asynccontextmanager
 import time
 from base64 import b64encode
-from .database import Database
+from database import Database
 import math
 
 
@@ -262,7 +262,6 @@ class ConnectionManager:
         except Exception as e:
             logger.error(f"Error optimizing image: {e}")
             return image_data  # Return original if optimization fails
-            
     async def fetch_album_art(self, url: str) -> Optional[bytes]:
         if not url:
             return None
@@ -282,29 +281,10 @@ class ConnectionManager:
             return None
             
     async def broadcast_album_art(self, art_data: bytes):
-        if not art_data:
-            return
-            
-        try:
-            # Send a notification that album art is coming
-            for connection in self.active_connections:
-                try:
-                    # First send a text message indicating that binary data is about to be sent
-                    await connection.send_text(json.dumps({
-                        "type": "album_art_coming",
-                        "size": len(art_data)
-                    }))
-                    
-                    # Then send the complete album art as binary data directly
-                    await connection.send_bytes(art_data)
-                    
-                    logger.info(f"Album art sent as binary data: {len(art_data)} bytes")
-                    
-                except Exception as e:
-                    logger.error(f"Error sending album art to client: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Error processing album art for broadcast: {e}")
+        # This method is now deprecated - album art URLs are sent directly in track_info
+        # Keeping as a stub for backward compatibility
+        logger.info("broadcast_album_art called but we're now using URLs instead of binary data")
+        return
 
 manager = ConnectionManager()
 
