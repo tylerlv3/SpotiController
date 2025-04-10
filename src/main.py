@@ -1,32 +1,173 @@
-from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect
+import os
+import json
+import logging
+import asyncio
+import aiohttp
+import requests
+from datetime import datetime
+import socket
+from fastapi import FastAPI, WebSocket, Request, HTTPException, WebSocketDisconnect
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-import os
-from dotenv import load_dotenv
-import json
-import asyncio
 from typing import List, Dict, Any, Optional
-import base64
-import aiohttp
-from datetime import datetime, timedelta
-import logging
 from PIL import Image
 import io
+from contextlib import asynccontextmanager
+import time
+from base64 import b64encode
+from database import Database
 import math
-from .database import Database
+
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+# Load environment variables
+from dotenv import load_dotenv
 load_dotenv()
-
-app = FastAPI()
 
 # Initialize database
 db = Database()
+
+# Spotify API configuration
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API_BASE_URL = "https://api.spotify.com/v1"
+SPOTIFY_SCOPE = "user-read-playback-state user-read-currently-playing"
+
+class SpotifyClient:
+    """Direct implementation of Spotify Web API client"""
+    
+    def __init__(self, access_token: str = None):
+        self.access_token = access_token
+        self.session = requests.Session()
+        
+    @classmethod
+    def get_auth_url(cls) -> str:
+        """Generate the Spotify authorization URL"""
+        params = {
+            "client_id": SPOTIFY_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "scope": SPOTIFY_SCOPE
+        }
+        return f"{SPOTIFY_AUTH_URL}?{requests.compat.urlencode(params)}"
+    
+    @classmethod
+    def get_access_token(cls, code: str) -> dict:
+        """Exchange authorization code for access token"""
+        auth_header = b64encode(
+            f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
+        ).decode()
+        
+        headers = {
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": SPOTIFY_REDIRECT_URI
+        }
+        
+        response = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
+        response.raise_for_status()
+        
+        token_info = response.json()
+        token_info["expires_at"] = time.time() + token_info["expires_in"]
+        return token_info
+    
+    @classmethod
+    def refresh_access_token(cls, refresh_token: str) -> dict:
+        """Refresh an expired access token"""
+        auth_header = b64encode(
+            f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
+        ).decode()
+        
+        headers = {
+            "Authorization": f"Basic {auth_header}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }
+        
+        response = requests.post(SPOTIFY_TOKEN_URL, headers=headers, data=data)
+        response.raise_for_status()
+        
+        token_info = response.json()
+        token_info["expires_at"] = time.time() + token_info["expires_in"]
+        return token_info
+    
+    def _make_request(self, method: str, endpoint: str, **kwargs) -> dict:
+        """Make a request to the Spotify API with proper headers and error handling"""
+        if not self.access_token:
+            raise ValueError("No access token available")
+            
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers"))
+            
+        url = f"{SPOTIFY_API_BASE_URL}/{endpoint.lstrip('/')}"
+        response = self.session.request(method, url, headers=headers, **kwargs)
+        
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 1))
+            logger.warning(f"Rate limited. Waiting {retry_after} seconds")
+            time.sleep(retry_after)
+            return self._make_request(method, endpoint, **kwargs)
+            
+        response.raise_for_status()
+        return response.json() if response.content else None
+    
+    def current_playback(self) -> Optional[dict]:
+        """Get information about user's current playback state"""
+        try:
+            return self._make_request("GET", "me/player")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 204:
+                return None
+            raise
+
+async def get_spotify_client() -> Optional[SpotifyClient]:
+    """Get a Spotify client with valid token, refreshing if needed"""
+    token_info = db.get_token()
+    
+    if not token_info:
+        logger.warning("No token available")
+        return None
+        
+    now = time.time()
+    is_expired = token_info["expires_at"] - now < 60
+    
+    if is_expired:
+        try:
+            logger.info("Token expired, refreshing...")
+            new_token = SpotifyClient.refresh_access_token(token_info["refresh_token"])
+            db.save_token(new_token)
+            token_info = new_token
+        except Exception as e:
+            logger.error(f"Error refreshing token: {e}")
+            db.clear_tokens()
+            return None
+            
+    return SpotifyClient(access_token=token_info["access_token"])
+
+app = FastAPI()
 
 # CORS middleware configuration
 app.add_middleware(
@@ -37,78 +178,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Spotify API configuration
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
-SPOTIFY_SCOPE = "user-read-playback-state user-read-currently-playing"
-
-# Spotify auth manager
-auth_manager = SpotifyOAuth(
-    client_id=SPOTIFY_CLIENT_ID,
-    client_secret=SPOTIFY_CLIENT_SECRET,
-    redirect_uri=SPOTIFY_REDIRECT_URI,
-    scope=SPOTIFY_SCOPE,
-    open_browser=False
-)
-
-def get_spotify_client():
-    # Try to get token from database first
-    token_info = db.get_token()
-    
-    if token_info:
-        # Check if token is expired
-        now = datetime.now().timestamp()
-        is_expired = token_info['expires_at'] - now < 60  # Add 60 second buffer
-        
-        if is_expired:
-            try:
-                # Refresh the token
-                logger.info("Token expired, refreshing...")
-                token_info = auth_manager.refresh_access_token(token_info['refresh_token'])
-                db.save_token(token_info)
-                logger.info("Token refreshed and saved to database")
-            except Exception as e:
-                logger.error(f"Error refreshing token: {e}")
-                return None
-    else:
-        # Try to get cached token from Spotipy's cache
-        token_info = auth_manager.get_cached_token()
-        if token_info:
-            # Save to our database
-            db.save_token(token_info)
-            logger.info("Retrieved cached token and saved to database")
-    
-    if token_info:
-        return spotipy.Spotify(auth=token_info['access_token'])
-    return None
-
 @app.get("/login")
 async def login():
-    """Redirect to Spotify authorization page"""
-    auth_url = auth_manager.get_authorize_url()
+    """Generate a Spotify login URL"""
+    auth_url = SpotifyClient.get_auth_url()
     return RedirectResponse(url=auth_url)
-
+    
 @app.get("/callback")
 async def callback(request: Request):
-    """Handle the callback from Spotify"""
+    """Handle Spotify OAuth callback"""
     code = request.query_params.get("code")
-    if code:
-        try:
-            token_info = auth_manager.get_access_token(code)
-            # Save token to database
-            db.save_token(token_info)
-            logger.info("New token saved to database")
-            return {"status": "Successfully authenticated with Spotify!"}
-        except Exception as e:
-            logger.error(f"Error getting access token: {e}")
-            return {"error": "Failed to get access token"}
-    return {"error": "No code provided"}
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code missing")
+        
+    try:
+        token_info = SpotifyClient.get_access_token(code)
+        db.save_token(token_info)
+        logger.info("New Spotify token acquired and saved")
+        return RedirectResponse(url="/")
+    except Exception as e:
+        logger.error(f"Error in callback: {e}")
+        raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
 
 @app.get("/")
 async def root():
     """Check authentication status and redirect if needed"""
-    if not get_spotify_client():
+    if not await get_spotify_client():
         return RedirectResponse(url="/login")
     return {"status": "Authenticated", "message": "Spotify WebSocket server is running"}
 
@@ -192,7 +287,7 @@ class ConnectionManager:
             
         try:
             # Encode optimized image
-            album_art_base64 = base64.b64encode(art_data).decode('utf-8')
+            album_art_base64 = b64encode(art_data).decode('utf-8')
             
             # Calculate chunk size (approximately 8KB per chunk)
             chunk_size = 8192
@@ -258,7 +353,7 @@ async def websocket_endpoint(websocket: WebSocket):
 async def update_playback():
     while True:
         try:
-            spotify = get_spotify_client()
+            spotify = await get_spotify_client()
             if not spotify:
                 logger.error("No valid Spotify client available - authentication needed")
                 await asyncio.sleep(5)  # Wait longer when auth is needed
@@ -306,14 +401,12 @@ async def update_playback():
                     await manager.broadcast(json.dumps(track_info))
                 else:
                     logger.info("No active playback found")
-            except spotipy.exceptions.SpotifyException as se:
-                if se.http_status == 401:
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
                     logger.error("Spotify authentication expired, forcing refresh")
-                    # Force token refresh on next iteration
-                    global token_info
-                    token_info = None
+                    db.clear_tokens()
                 else:
-                    logger.error(f"Spotify API error: {se}")
+                    logger.error(f"Spotify API error: {e}")
             
         except Exception as e:
             logger.error(f"Error updating playback: {e}")
@@ -322,7 +415,6 @@ async def update_playback():
 
 @app.on_event("startup")
 async def startup_event():
-    import socket
     logger.info("="*50)
     logger.info("Starting Spotify WebSocket server...")
     
