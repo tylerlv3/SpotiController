@@ -262,7 +262,7 @@ class ConnectionManager:
         except Exception as e:
             logger.error(f"Error optimizing image: {e}")
             return image_data  # Return original if optimization fails
-
+            
     async def fetch_album_art(self, url: str) -> Optional[bytes]:
         if not url:
             return None
@@ -280,46 +280,25 @@ class ConnectionManager:
         except Exception as e:
             logger.error(f"Error fetching album art: {e}")
             return None
-
+            
     async def broadcast_album_art(self, art_data: bytes):
         if not art_data:
             return
             
         try:
-            # Encode optimized image
-            album_art_base64 = b64encode(art_data).decode('utf-8')
-            
-            # Calculate chunk size (approximately 8KB per chunk)
-            chunk_size = 8192
-            total_chunks = math.ceil(len(album_art_base64) / chunk_size)
-            
+            # Send a notification that album art is coming
             for connection in self.active_connections:
                 try:
-                    # Send metadata about the incoming chunks
+                    # First send a text message indicating that binary data is about to be sent
                     await connection.send_text(json.dumps({
-                        "type": "album_art_start",
-                        "total_chunks": total_chunks
+                        "type": "album_art_coming",
+                        "size": len(art_data)
                     }))
                     
-                    # Send the art data in chunks
-                    for i in range(total_chunks):
-                        start = i * chunk_size
-                        end = start + chunk_size
-                        chunk = album_art_base64[start:end]
-                        
-                        await connection.send_text(json.dumps({
-                            "type": "album_art_chunk",
-                            "chunk_index": i,
-                            "data": chunk
-                        }))
-                        
-                        # Small delay between chunks to prevent overwhelming the connection
-                        await asyncio.sleep(0.05)
+                    # Then send the complete album art as binary data directly
+                    await connection.send_bytes(art_data)
                     
-                    # Send completion message
-                    await connection.send_text(json.dumps({
-                        "type": "album_art_end"
-                    }))
+                    logger.info(f"Album art sent as binary data: {len(art_data)} bytes")
                     
                 except Exception as e:
                     logger.error(f"Error sending album art to client: {e}")
