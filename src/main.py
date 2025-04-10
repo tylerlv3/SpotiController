@@ -240,21 +240,21 @@ class ConnectionManager:
             if conn in self.active_connections:
                 self.disconnect(conn)
 
-    async def optimize_album_art(self, image_data: bytes, target_size: int = 150) -> bytes:
+    async def optimize_album_art(self, image_data: bytes, target_size: int = 100) -> bytes:
         try:
             # Open the image using PIL
             with Image.open(io.BytesIO(image_data)) as img:
                 # Convert to RGB mode first
                 if img.mode in ('RGBA', 'LA', 'P'):
                     img = img.convert('RGB')
-                
+
                 # Calculate new dimensions while maintaining aspect ratio
                 ratio = min(target_size / img.width, target_size / img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
-                
+
                 # Resize image using high-quality downsampling
                 img = img.resize(new_size, Image.Resampling.LANCZOS)
-                
+
                 # Convert to JPEG with optimization
                 output = io.BytesIO()
                 img.save(output, format='JPEG', optimize=True, quality=85)
