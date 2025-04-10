@@ -352,8 +352,7 @@ async def update_playback():
                         "duration_ms": current_playback["item"]["duration_ms"],
                         "is_playing": current_playback["is_playing"]
                     }
-                    
-                    # Check if we need to fetch new album art (only if it has changed)
+                      # Check if we need to fetch new album art (only if it has changed)
                     album_art_url = current_playback["item"]["album"]["images"][0]["url"]
                     # Get a smaller image if available to reduce payload size
                     for image in current_playback["item"]["album"]["images"]:
@@ -362,24 +361,19 @@ async def update_playback():
                             album_art_url = image["url"]
                             break
 
-                    # Only fetch new album art if it's different from the last one
+                    # Only update album art URL if it's different from the last one
                     if manager.last_album_art != album_art_url:
-                        logger.info("Fetching new album art")
-                        art_data = await manager.fetch_album_art(album_art_url)
-                        if art_data:
-                            # Send album art separately to avoid large messages
-                            await manager.broadcast_album_art(art_data)
-                        else:
-                            logger.warning("Failed to fetch new album art")
+                        logger.info(f"New album art URL detected: {album_art_url}")
+                        manager.last_album_art = album_art_url
 
-                    # Add URL instead of base64 in the main payload
-                    track_info["album_art"] = album_art_url
-                    track_info["type"] = "track_update"
-                    
-                    manager.current_playback = track_info
-                    await manager.broadcast(json.dumps(track_info))
-                else:
-                    logger.info("No active playback found")
+                        # Add URL directly in the main payload
+                        track_info["album_art_url"] = album_art_url
+                        track_info["type"] = "track_update"
+                        
+                        manager.current_playback = track_info
+                        await manager.broadcast(json.dumps(track_info))
+                    else:
+                        print("No change in album art URL, skipping fetch")
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 401:
                     logger.error("Spotify authentication expired, forcing refresh")
